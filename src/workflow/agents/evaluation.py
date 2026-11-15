@@ -7,7 +7,10 @@ from workflow.agents.tool import Tool
 
 class ExecutionAccuracy(Tool):
     """
-    Tool for evaluating the predicted SQL queries against the ground truth SQL query.
+    Tool for executing the predicted SQL queries and recording their execution status.
+
+    DataMate tasks carry no gold SQL, so this tool never compares against ground truth: it
+    executes the predicted SQL and reports what the engine said about it.
     """
 
     def __init__(self):
@@ -65,23 +68,39 @@ class ExecutionAccuracy(Tool):
     
     def _log_sql_result(self, state: SystemState, SQL: str) -> Dict:
         """
-        Log the result of the SQL query comparison against the ground truth SQL query.
+        Executes the SQL query and logs its execution status.
         
         Args:
             state (SystemState): The current system state.
-            SQL (str): The SQL query to compare.
+            SQL (str): The SQL query to execute.
             
         Returns:
-            Dict[str, Any]: A dictionary containing the evaluation results.
+            Dict[str, Any]: A dictionary containing the execution results.
         """
         
-        response = DatabaseManager().compare_sqls(
-            predicted_sql=SQL,
-            ground_truth_sql=state.task.SQL,
-        )
+        database_manager = DatabaseManager()
+        try:
+            rows = database_manager.execute_sql(SQL, fetch=20)
+        except Exception as e:
+            Logger().log(
+                f"Node 'evaluation': {state.task.db_id}_{state.task.question_id}\n{type(e)}: {e}\n",
+                "error",
+            )
+            return {
+                "exec_res": "error",
+                "exec_err": str(e),
+                "rows": [],
+                "row_count": 0,
+                "exec_status": "TIMEOUT" if isinstance(e, TimeoutError) else "SYNTACTICALLY_INCORRECT",
+            }
+        
+        execution_status = database_manager.get_execution_status(SQL, execution_result=rows)
         result = {
-            "exec_res": response["exec_res"],
-            "exec_err": response["exec_err"],
+            "exec_res": "completed",
+            "exec_err": None,
+            "rows": [list(row) for row in rows],
+            "row_count": len(rows),
+            "exec_status": execution_status.value,
         }
         
         return result

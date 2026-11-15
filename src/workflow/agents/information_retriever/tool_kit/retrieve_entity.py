@@ -1,12 +1,15 @@
 import numpy as np
 import difflib
+import logging
 from typing import List, Dict, Any, Tuple, Optional
 
-from langchain_openai import OpenAIEmbeddings
+from datamate.embedding import get_embedding_function
 from google.oauth2 import service_account
 from google.cloud import aiplatform
 import vertexai
 import os
+
+logger = logging.getLogger(__name__)
 
 GCP_PROJECT = os.getenv("GCP_PROJECT")
 GCP_REGION = os.getenv("GCP_REGION")
@@ -21,6 +24,7 @@ if GCP_CREDENTIALS and GCP_PROJECT and GCP_REGION:
     vertexai.init(project=GCP_PROJECT, location=GCP_REGION, credentials=service_account.Credentials.from_service_account_file(GCP_CREDENTIALS))
 
 from runner.database_manager import DatabaseManager
+from database_utils.db_values.preprocess import lsh_parameters
 from workflow.system_state import SystemState
 from workflow.agents.tool import Tool
 
@@ -31,9 +35,13 @@ class RetrieveEntity(Tool):
 
     def __init__(self):
         super().__init__()
-        self.embedding_function = OpenAIEmbeddings(model="text-embedding-3-small")
+        self.embedding_function = get_embedding_function()
         self.edit_distance_threshold = 0.3
-        self.embedding_similarity_threshold = 0.6
+        # Similarity scales differ per embedding model: these two are env-tunable so
+        # the values can follow the measured bge-m3 distribution instead of the
+        # thresholds that were tuned for OpenAI vectors.
+        self.embedding_similarity_threshold = float(os.getenv("ENTITY_SIM_THRESHOLD") or 0.45)
+        self.top_sim_ratio = float(os.getenv("TOP_SIM_RATIO") or 0.90)
         
         self.retrieved_entities = []
         
@@ -213,9 +221,9 @@ class RetrieveEntity(Tool):
         for table_name, column_values in selected_values.items():
             for column_name, values in column_values.items():
                 max_edit_distance_similarity = max(entity["edit_distance_similarity"] for entity in values)
-                values = [entity for entity in values if entity["edit_distance_similarity"] >= 0.9*max_edit_distance_similarity]
+                values = [entity for entity in values if entity["edit_distance_similarity"] >= self.top_sim_ratio*max_edit_distance_similarity]
                 max_embedding_similarity = max(entity["embedding_similarity"] for entity in values)
-                selected_values[table_name][column_name] = [entity['similar_value'] for entity in values if entity["embedding_similarity"] >= 0.9*max_embedding_similarity]
+                selected_values[table_name][column_name] = [entity['similar_value'] for entity in values if entity["embedding_similarity"] >= self.top_sim_ratio*max_embedding_similarity]
                     
         return selected_values
 
@@ -249,12 +257,41 @@ class RetrieveEntity(Tool):
         to_search_values.sort(key=lambda x: (x["keyword"], len(x["substring"]), x["substring"]), reverse=True)
         return to_search_values
     
+    def _lsh_parameters(self) -> Dict[str, Any]:
+        """
+        Returns the parameters the loaded value index was built with.
+
+        The build side records them inside the pickled index, so the query sketch is
+        built with the index's own numbers by construction instead of a copy kept here
+        that could drift from them (a 100-permutation sketch cannot share a bucket with a
+        128-permutation index and would silently match nothing).
+
+        Returns:
+            Dict[str, Any]: The recorded ``num_perm``, ``threshold``, ``shingle_k`` and
+                ``max_sample_values`` of the index.
+
+        Raises:
+            Exception: If the index cannot be loaded.
+        """
+        database_manager = DatabaseManager()
+        if database_manager.set_lsh() != "success":
+            raise RuntimeError(f"Error loading LSH for {database_manager.db_id}")
+        return lsh_parameters(database_manager.lsh)
+
     def _get_similar_entities_via_LSH(self, substring_packets: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        if not substring_packets:
+            return []
+        index_parameters = self._lsh_parameters()
         similar_entities_via_LSH = []
         for packet in substring_packets:
             keyword = packet["keyword"]
             substring = packet["substring"]
-            unique_similar_values = DatabaseManager().query_lsh(keyword=substring, signature_size=100, top_n=10)
+            unique_similar_values = DatabaseManager().query_lsh(
+                keyword=substring,
+                signature_size=int(index_parameters["num_perm"]),
+                n_gram=int(index_parameters["shingle_k"]),
+                top_n=10,
+            )
             for table_name, column_values in unique_similar_values.items():
                 for column_name, values in column_values.items():
                     for value in values:
@@ -291,6 +328,7 @@ class RetrieveEntity(Tool):
         
         all_embeddings = self.embedding_function.embed_documents(to_embed_strings)
         similar_entities_via_embedding_similarity = []
+        observed_similarities = []
         index = 0
         for keyword, substring_dict in similar_values_dict.items():
             for substring, entity_packets in substring_dict.items():
@@ -300,9 +338,21 @@ class RetrieveEntity(Tool):
                 index += len(entity_packets)
                 similarities = np.dot(similar_values_embeddings, substring_embedding)
                 for i, entity_packet in enumerate(entity_packets):
+                    observed_similarities.append(float(similarities[i]))
                     if similarities[i] >= self.embedding_similarity_threshold:
                         entity_packet["embedding_similarity"] = similarities[i]
                         similar_entities_via_embedding_similarity.append(entity_packet)
+        if observed_similarities:
+            # Logged so ENTITY_SIM_THRESHOLD is tunable from evidence, not guesswork.
+            logger.info(
+                "entity embedding similarity: n=%d min=%.3f p50=%.3f max=%.3f threshold=%.2f kept=%d",
+                len(observed_similarities),
+                min(observed_similarities),
+                float(np.median(observed_similarities)),
+                max(observed_similarities),
+                self.embedding_similarity_threshold,
+                len(similar_entities_via_embedding_similarity),
+            )
         return similar_entities_via_embedding_similarity
                 
     def _get_updates(self, state: SystemState) -> Dict:

@@ -1,6 +1,7 @@
 import os
 from pathlib import Path
 import logging
+from chromadb.config import Settings
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
 from langchain.schema.document import Document
@@ -11,6 +12,7 @@ from google.cloud import aiplatform
 import vertexai
 
 from database_utils.db_catalog.csv_utils import load_tables_description
+from datamate.embedding import get_embedding_function
 
 load_dotenv(override=True)
 
@@ -27,8 +29,8 @@ if GCP_CREDENTIALS and GCP_PROJECT and GCP_REGION:
     vertexai.init(project=GCP_PROJECT, location=GCP_REGION, credentials=service_account.Credentials.from_service_account_file(GCP_CREDENTIALS))
 
 
-# EMBEDDING_FUNCTION = VertexAIEmbeddings(model_name="text-embedding-004")#OpenAIEmbeddings(model="text-embedding-3-large")
-EMBEDDING_FUNCTION = OpenAIEmbeddings(model="text-embedding-3-large")
+# Local bge-m3 by default; the object is lazy, so this import loads no weights.
+EMBEDDING_FUNCTION = get_embedding_function()
 
 
 def make_db_context_vec_db(db_directory_path: str, **kwargs) -> None:
@@ -66,6 +68,18 @@ def make_db_context_vec_db(db_directory_path: str, **kwargs) -> None:
 
     vector_db_path.mkdir(exist_ok=True)
 
-    Chroma.from_documents(docs, EMBEDDING_FUNCTION, persist_directory=str(vector_db_path))
+    Chroma.from_documents(
+        docs,
+        EMBEDDING_FUNCTION,
+        persist_directory=str(vector_db_path),
+        # Persistence is decided by Settings.is_persistent in chromadb 0.5.20; telemetry-only
+        # settings next to persist_directory produce an in-memory client that answers queries
+        # but writes nothing, so both flags are required together.
+        client_settings=Settings(
+            anonymized_telemetry=False,
+            is_persistent=True,
+            persist_directory=str(vector_db_path),
+        ),
+    )
 
     logging.info(f"Context vector database created at {vector_db_path}")

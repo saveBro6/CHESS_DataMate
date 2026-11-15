@@ -61,6 +61,16 @@ class SystemState(BaseModel):
         Returns:
             Dict[str, Any]: A dictionary with the status of missing tables and columns.
         """
+        # An unlabelled task has no gold SQL to compare the tentative schema against
+        # (DataMate supplies an as_of_date, not a reference query), so nothing can be missing.
+        if not self.task.SQL:
+            return {
+                "missing_table_status": "success",
+                "missing_tables": [],
+                "missing_column_status": "success",
+                "missing_columns": [],
+                "correct_columns": {},
+            }
         ground_truth_sql = self.task.SQL
         correct_columns = DatabaseManager().get_sql_columns_dict(sql=ground_truth_sql)
         missing_tables = []

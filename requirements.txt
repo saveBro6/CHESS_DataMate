@@ -13,7 +13,7 @@ langchain_google_vertexai==1.0.8
 google-cloud-aiplatform==1.63.0
 langchain-openai==0.1.12
 langgraph==0.1.4
-pandas==2.2.1
+pandas>=2.3,<3
 pip-chill==1.0.3
 pipreqs==0.5.0
 python-dotenv==1.0.1
@@ -23,6 +23,19 @@ uvloop==0.19.0
 watchfiles==0.21.0
 websockets==12.0
 filelock==3.15.4
-faiss-cpu==1.8.0
+faiss-cpu==1.16.0
 datasets==2.21.0
 pyyaml==6.0.2
+
+# DataMate runner runtime: tabular ingestion (polars + fastexcel), local bge-m3
+# embeddings, and the pinned LLM/vector-store clients. numpy 2 is what lets
+# FlagEmbedding, pyarrow and chromadb co-exist, so keep pandas below 3.
+numpy>=2.5,<3
+pyarrow>=26
+polars==2.1.0
+fastexcel==0.21.0
+torch>=2.15
+transformers>=4.57
+FlagEmbedding==1.4.2
+chromadb==0.5.20
+openai>=1.109

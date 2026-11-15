@@ -7,6 +7,38 @@ from llm.engine_configs import ENGINE_CONFIGS
 from runner.logger import Logger
 from threading_utils import ordered_concurrent_function_calls
 
+
+class LLMEmptyResponse(RuntimeError):
+    """
+    Raised when the engine returned no usable content on every attempt.
+    """
+
+
+def coerce_content(output: Any) -> str:
+    """
+    Returns the stripped text of an LLM response, tolerating a missing content field.
+
+    A reasoning model can spend the whole token budget on reasoning tokens and answer with
+    `content: null`; that is an empty response, not an AttributeError.
+
+    Args:
+        output (Any): The raw engine output, either a message object or a plain string.
+
+    Returns:
+        str: The stripped content, or "" when the response carried none.
+    """
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output.strip()
+    content = getattr(output, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    return str(content).strip()
+
+
 def get_llm_chain(engine_name: str, temperature: float = 0, base_uri: str = None) -> Any:
     """
     Returns the appropriate LLM chain based on the provided engine name and temperature.
@@ -69,14 +101,8 @@ def call_llm_chain(prompt: Any, engine: Any, parser: Any, request_kwargs: Dict[s
             chain = prompt | engine
             prompt_text = prompt.invoke(request_kwargs).messages[0].content
             output = chain.invoke(request_kwargs)
-            if isinstance(output, str):
-                if output.strip() == "":
-                    engine = get_llm_chain("gemini-1.5-flash")
-                    raise OutputParserException("Empty output")
-            else:
-                if output.content.strip() == "":    
-                    engine = get_llm_chain("gemini-1.5-flash")
-                    raise OutputParserException("Empty output")
+            if coerce_content(output) == "":
+                raise LLMEmptyResponse(f"Engine {type(engine).__name__} returned empty content on attempt {attempt + 1}")
             output = parser.invoke(output)
             logger.log_conversation(
                 [
@@ -93,6 +119,11 @@ def call_llm_chain(prompt: Any, engine: Any, parser: Any, request_kwargs: Dict[s
                 ]
             )
             return output
+        except LLMEmptyResponse as e:
+            logger.log(f"LLMEmptyResponse: {e}", "warning")
+            if attempt == max_attempts - 1:
+                logger.log(f"call_chain: {e}", "error")
+                raise e
         except OutputParserException as e:
             logger.log(f"OutputParserException: {e}", "warning")
             new_parser = OutputFixingParser.from_llm(parser=parser, llm=engine)
@@ -180,7 +211,15 @@ def call_engine(message: str, engine: Any, max_attempts: int = 12, backoff_base:
     for attempt in range(max_attempts):
         try:
             output = engine.invoke(message)
-            return output.content
+            content = coerce_content(output)
+            if content == "":
+                raise LLMEmptyResponse(f"Engine {type(engine).__name__} returned empty content on attempt {attempt + 1}")
+            return content
+        except LLMEmptyResponse as e:
+            logger.log(f"LLMEmptyResponse: {e}", "warning")
+            if attempt == max_attempts - 1:
+                logger.log(f"call_engine: {e}", "error")
+                raise e
         except Exception as e:
             # if attempt < max_attempts - 1:
             #     logger.log(f"Failed to invoke the chain {attempt + 1} times.\n{type(e)}\n{e}", "warning")

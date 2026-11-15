@@ -93,6 +93,18 @@ ENGINE_CONFIGS: Dict[str, Dict[str, Any]] = {
         "constructor": ChatOpenAI,
         "params": {"model": "gpt-4o-mini", "temperature": 0}
     },
+    # DataMate engine: model, endpoint and token budget follow the environment so the same
+    # code runs against an OpenAI-compatible gateway offline-style, with no cloud fallback.
+    "datamate": {
+        "constructor": ChatOpenAI,
+        "params": {
+            "model": os.getenv("OPENAI_LLM", "gpt-4o-mini"),
+            "openai_api_base": os.getenv("OPENAI_BASE_URL") or None,
+            "max_tokens": int(os.getenv("LLM_MAX_TOKENS") or 4096),
+            "temperature": 0,
+            "max_retries": 2
+        }
+    },
     "claude-3-opus-20240229": {
         "constructor": ChatAnthropic,
         "params": {"model": "claude-3-opus-20240229", "temperature": 0}

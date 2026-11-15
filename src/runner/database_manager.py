@@ -5,6 +5,7 @@ from threading import Lock
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_chroma import Chroma
+from chromadb.config import Settings
 from typing import Callable, Dict, List, Any
 import time
 
@@ -19,10 +20,14 @@ from database_utils.db_catalog.preprocess import EMBEDDING_FUNCTION
 from database_utils.db_catalog.csv_utils import load_tables_description
 
 load_dotenv(override=True)
-DB_ROOT_PATH = Path(os.getenv("DB_ROOT_PATH"))
 
-INDEX_SERVER_HOST = os.getenv("INDEX_SERVER_HOST")
-INDEX_SERVER_PORT = int(os.getenv("INDEX_SERVER_PORT"))
+# Import-time defaults: importing the CHESS stack must never raise when the environment is
+# absent (offline image, unit import, data preparation run), so every module-level read here
+# falls back to the same value `.env` declares.
+DB_ROOT_PATH = Path(os.getenv("DB_ROOT_PATH") or "./data/dev")
+
+INDEX_SERVER_HOST = os.getenv("INDEX_SERVER_HOST") or "localhost"
+INDEX_SERVER_PORT = int(os.getenv("INDEX_SERVER_PORT") or 8000)
 
 class DatabaseManager:
     """
@@ -93,7 +98,19 @@ class DatabaseManager:
         if self.vector_db is None:
             try:
                 vector_db_path = self.db_directory_path / "context_vector_db"
-                self.vector_db = Chroma(persist_directory=str(vector_db_path), embedding_function=EMBEDDING_FUNCTION)
+                self.vector_db = Chroma(
+                    persist_directory=str(vector_db_path),
+                    embedding_function=EMBEDDING_FUNCTION,
+                    # chromadb 0.5.20 keys persistence off Settings.is_persistent, and
+                    # langchain-chroma 0.1.2 only fills persist_directory when client_settings
+                    # is supplied. Telemetry-only settings therefore build an *in-memory*
+                    # client that still answers queries, so the flag pair is mandatory.
+                    client_settings=Settings(
+                        anonymized_telemetry=False,
+                        is_persistent=True,
+                        persist_directory=str(vector_db_path),
+                    ),
+                )
                 return "success"
             except Exception as e:
                 self.vector_db = "error"
