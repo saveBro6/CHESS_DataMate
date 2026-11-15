@@ -11,8 +11,11 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
+
+from datamate.constants import DEFAULT_EMBED_GPU_UTIL, DEFAULT_PROD_GPU_UTIL, DEFAULT_PROD_MODEL
 
 DEFAULT_SPLIT_DIR = Path("dataset/train")
 DEFAULT_WORK_ROOT = Path("/tmp/datamate-work")
@@ -34,6 +37,17 @@ class Settings:
     sql_timeout_s: int
     entity_sim_threshold: float
     top_sim_ratio: float
+    use_vllm: bool = False
+    vllm_model: str = DEFAULT_PROD_MODEL
+    gpu_memory_util: float = DEFAULT_PROD_GPU_UTIL
+    gpu_embed_memory_util: float = DEFAULT_EMBED_GPU_UTIL
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_int(name: str, default: int) -> int:
@@ -72,6 +86,10 @@ def load_settings(**overrides) -> Settings:
         sql_timeout_s=_env_int("SQL_TIMEOUT_S", 20),
         entity_sim_threshold=_env_float("ENTITY_SIM_THRESHOLD", 0.45),
         top_sim_ratio=_env_float("TOP_SIM_RATIO", 0.90),
+        use_vllm=_env_bool("USE_VLLM", False),
+        vllm_model=(os.getenv("VLLM_MODEL") or DEFAULT_PROD_MODEL).strip(),
+        gpu_memory_util=_env_float("VLLM_GPU_MEMORY_UTILIZATION", DEFAULT_PROD_GPU_UTIL),
+        gpu_embed_memory_util=_env_float("VLLM_EMBEDDING_GPU_MEMORY_UTILIZATION", DEFAULT_EMBED_GPU_UTIL),
     )
     if not overrides:
         return base
@@ -96,3 +114,53 @@ def apply_env(settings: Settings) -> None:
     os.environ["TOP_SIM_RATIO"] = str(settings.top_sim_ratio)
     os.environ["LLM_MAX_TOKENS"] = str(settings.llm_max_tokens)
     os.environ["SQL_TIMEOUT_S"] = str(settings.sql_timeout_s)
+    os.environ["USE_VLLM"] = "1" if settings.use_vllm else "0"
+    os.environ["VLLM_MODEL"] = settings.vllm_model
+    os.environ["VLLM_GPU_MEMORY_UTILIZATION"] = str(settings.gpu_memory_util)
+    os.environ["VLLM_EMBEDDING_GPU_MEMORY_UTILIZATION"] = str(settings.gpu_embed_memory_util)
+
+
+def add_vllm_args(parser: Any) -> None:
+    """Register shared vLLM CLI flags on an ArgumentParser."""
+    parser.add_argument(
+        "--vllm",
+        action="store_true",
+        default=False,
+        help="use offline VLLMEngine and SemanticVectorIndexer (bge-m3 pooling) instead of the default pipeline",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        help=f"vLLM model name or path when --vllm is enabled (default: {DEFAULT_PROD_MODEL})",
+    )
+    parser.add_argument(
+        "--gpu-memory-util",
+        "--gpu-memory-utilization",
+        dest="gpu_memory_util",
+        type=float,
+        default=None,
+        help=f"GPU memory utilization for VLLMEngine (default: {DEFAULT_PROD_GPU_UTIL})",
+    )
+    parser.add_argument(
+        "--gpu-embed-memory-util",
+        "--gpu-embed-memory-utilization",
+        dest="gpu_embed_memory_util",
+        type=float,
+        default=None,
+        help=f"GPU memory utilization for bge-m3 embedding via vLLM pooling (default: {DEFAULT_EMBED_GPU_UTIL})",
+    )
+
+
+def vllm_overrides(arguments: Any) -> dict[str, Any]:
+    """Extract Settings overrides for vLLM flags from parsed CLI arguments."""
+    overrides: dict[str, Any] = {}
+    if getattr(arguments, "vllm", False):
+        overrides["use_vllm"] = True
+    if getattr(arguments, "model", None):
+        overrides["vllm_model"] = arguments.model
+    if getattr(arguments, "gpu_memory_util", None) is not None:
+        overrides["gpu_memory_util"] = arguments.gpu_memory_util
+    if getattr(arguments, "gpu_embed_memory_util", None) is not None:
+        overrides["gpu_embed_memory_util"] = arguments.gpu_embed_memory_util
+    return overrides

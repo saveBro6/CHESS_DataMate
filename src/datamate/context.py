@@ -37,7 +37,7 @@ from typing import Any, Sequence
 
 import polars as pl
 
-from datamate.config import Settings, load_settings
+from datamate.config import Settings, add_vllm_args, apply_env, load_settings, vllm_overrides
 from datamate.ingest.store import STATE_CLASSES, BusinessStore, PreparedBusiness
 from datamate.questions import Question, fold_vietnamese, load_questions
 
@@ -1144,10 +1144,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="skip the per-business LLM status mapping when a business has to be prepared",
     )
+    add_vllm_args(parser)
     arguments = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    settings = load_settings(**({"split_dir": arguments.split} if arguments.split else {}))
+    overrides = vllm_overrides(arguments)
+    if arguments.split:
+        overrides["split_dir"] = arguments.split
+    settings = load_settings(**overrides)
+    apply_env(settings)
     started = time.time()
     try:
         questions = load_questions(settings.split_dir, limit=arguments.limit)

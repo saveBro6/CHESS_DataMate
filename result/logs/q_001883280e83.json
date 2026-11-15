@@ -1,0 +1,119 @@
+{
+  "qid": "q_001883280e83",
+  "question": {
+    "qid": "q_001883280e83",
+    "business_id": "biz_128",
+    "text": "tháng này tổng giá trị các phiếu nhập hàng là bao nhiu",
+    "as_of_date": "2026-09-07",
+    "order": 0
+  },
+  "pack": {
+    "sha256": "3b68aa3e30e4b3f86e0ebe77b949c8c0a7fa7171420a0311f70d109550a347ed",
+    "chars": 43167,
+    "sections": {
+      "AS_OF_DATE": 296,
+      "PERIOD_NOTES": 1132,
+      "RULEBOOK": 14919,
+      "CALENDAR_WINDOW": 3470,
+      "README_NOTES": 3728,
+      "DATA_RANGE": 1888,
+      "SCHEMA": 11852,
+      "REVENUE": 480,
+      "DATA_QUALITY": 540,
+      "STATUS_NOTES": 2833,
+      "WARNINGS": 2029
+    }
+  },
+  "outcome": {
+    "final_sql": " SELECT IFNULL(SUM(\"can_tra_ncc__num\"), 0)  FROM \"danh_sach_nhap_hang\"  WHERE \"thoi_gian__date\" BETWEEN '2026-09-01' AND '2026-09-07'    AND \"trang_thai\" = 'Đã nhập hàng'; ",
+    "exec_status": "OK",
+    "row_count": 1,
+    "preview_truncated": false,
+    "rows": [
+      [
+        89526400.0
+      ]
+    ],
+    "steps": [
+      {
+        "tool_name": "extract_keywords",
+        "status": "success",
+        "ms": 20900
+      },
+      {
+        "tool_name": "retrieve_entity",
+        "status": "success",
+        "ms": 40300
+      },
+      {
+        "tool_name": "retrieve_context",
+        "status": "success",
+        "ms": 52300
+      },
+      {
+        "tool_name": "generate_candidate",
+        "status": "success",
+        "ms": 18100
+      },
+      {
+        "tool_name": "revise",
+        "status": "success",
+        "ms": 0
+      },
+      {
+        "tool_name": "generate_unit_test",
+        "status": "success",
+        "ms": 0
+      },
+      {
+        "tool_name": "evaluate",
+        "status": "success",
+        "ms": 0
+      },
+      {
+        "tool_name": "execution_accuracy",
+        "status": "success",
+        "ms": 0
+      }
+    ],
+    "llm_calls": 15,
+    "elapsed_s": 161.7,
+    "errors": [],
+    "abstain_reason": null
+  },
+  "answer": {
+    "id": "q_001883280e83",
+    "type": "number",
+    "answer": 89526400
+  },
+  "reason": null,
+  "timings": {
+    "prepare_s": 0.0,
+    "pack_s": 0.07,
+    "run_s": 161.7,
+    "compile_s": 2.025,
+    "compile": {
+      "abstained": false,
+      "llm_calls": 1,
+      "repairs": 0,
+      "violations": [],
+      "parse_ok": true,
+      "compile_s": 2.025
+    },
+    "total_s": 163.8
+  },
+  "model": {
+    "engine": "datamate",
+    "llm": "gpt-oss-120b",
+    "endpoint_host": "token-api.fpt.ai",
+    "embedding_provider": "local",
+    "embedding_device": "cuda:0",
+    "db_mode": "train"
+  },
+  "trace": {
+    "json": "result/logs/q_001883280e83.json",
+    "log": "result/logs/q_001883280e83.log",
+    "written_at": "2026-11-15T15:11:28+00:00",
+    "truncated": {}
+  }
+}

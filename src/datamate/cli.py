@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from datamate.answer import Answer, AnswerCompiler
-from datamate.config import Settings, apply_env, load_settings
+from datamate.config import Settings, add_vllm_args, apply_env, load_settings, vllm_overrides
 from datamate.output import SubmissionWriter, TraceWriter, to_submission_record
 from datamate.questions import Question, load_answers, load_questions
 from datamate.score import print_report
@@ -86,12 +86,13 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--prepare-all", action="store_true", help="materialise every business, then exit")
     parser.add_argument("--score", action="store_true", help="score the submission against the split's answers")
     parser.add_argument("--no-status-map", action="store_true", help="skip the LLM status mapping")
+    add_vllm_args(parser)
     return parser.parse_args(argv)
 
 
 def _settings_from(arguments: argparse.Namespace) -> Settings:
     """Resolve settings from the flags, falling back to the environment (``env.example``)."""
-    overrides: dict[str, Any] = {}
+    overrides: dict[str, Any] = vllm_overrides(arguments)
     if arguments.split:
         overrides["split_dir"] = Path(arguments.split)
     if arguments.result_dir:

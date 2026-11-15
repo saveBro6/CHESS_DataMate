@@ -1,4 +1,5 @@
 from typing import Any, Dict, List
+import os
 
 from langchain_core.exceptions import OutputParserException
 from langchain.output_parsers import OutputFixingParser
@@ -54,6 +55,11 @@ def get_llm_chain(engine_name: str, temperature: float = 0, base_uri: str = None
     Raises:
         ValueError: If the engine is not supported.
     """
+    if engine_name == "datamate" and os.getenv("USE_VLLM", "").strip().lower() in {"1", "true", "yes", "on"}:
+        from datamate.vllm_engine import get_vllm_chain
+
+        return get_vllm_chain(temperature=temperature)
+
     if engine_name not in ENGINE_CONFIGS:
         raise ValueError(f"Engine {engine_name} not supported")
     

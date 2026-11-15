@@ -23,6 +23,7 @@ from typing import Any
 from langchain_core.embeddings import Embeddings
 
 from datamate.config import load_settings
+from datamate.constants import DEFAULT_EMBED_GPU_UTIL, DEFAULT_EMBED_MODEL_PATH
 
 LOGGER = logging.getLogger(__name__)
 
@@ -61,17 +62,37 @@ class DatamateEmbeddings(Embeddings):
     Python floats so the vectors are JSON-serialisable.
     """
 
-    def __init__(self, *, provider: str, device: str, model: str, batch_size: int) -> None:
+    def __init__(
+        self,
+        *,
+        provider: str,
+        device: str,
+        model: str,
+        batch_size: int,
+        use_vllm: bool = False,
+        gpu_memory_utilization: float | None = None,
+    ) -> None:
         self.provider = provider
         self.model_name = model
         self.batch_size = batch_size
         self.requested_device = device
+        self.use_vllm = use_vllm
+        self.gpu_memory_utilization = gpu_memory_utilization
         self._device = device
         self._model: Any = None
         self._logged = False
 
+    def _is_vllm_enabled(self) -> bool:
+        return (
+            self.use_vllm
+            or self.provider == "vllm"
+            or os.environ.get("USE_VLLM", "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+
     def describe(self) -> str:
         """One-line description; reports the resolved device once loaded."""
+        if self._is_vllm_enabled():
+            return f"provider=vllm dim={EMBEDDING_DIM} model={self.model_name or DEFAULT_EMBED_MODEL_PATH}"
         if self.provider == "local":
             return f"provider=local dim={EMBEDDING_DIM} device={self._device}"
         return f"provider={self.provider} dim=unknown device=remote"
@@ -85,6 +106,30 @@ class DatamateEmbeddings(Embeddings):
         return self._model
 
     def _build_model(self) -> Any:
+        if self._is_vllm_enabled():
+            from datamate.vector_indexer import SemanticVectorIndexer
+
+            model_path = (
+                os.environ.get("EMBEDDING_MODEL_PATH")
+                or os.environ.get("EMBEDDING_MODEL")
+                or self.model_name
+                or DEFAULT_EMBED_MODEL_PATH
+            )
+            gpu_util = (
+                self.gpu_memory_utilization
+                if self.gpu_memory_utilization is not None
+                else float(os.environ.get("VLLM_EMBEDDING_GPU_MEMORY_UTILIZATION") or DEFAULT_EMBED_GPU_UTIL)
+            )
+            indexer = SemanticVectorIndexer(
+                model_path=model_path,
+                batch_size=self.batch_size,
+                gpu_memory_utilization=gpu_util,
+            )
+            _ = indexer.embedder
+            self._log_once(
+                f"embedding_provider=vllm dim={EMBEDDING_DIM} model={model_path} gpu_util={gpu_util}"
+            )
+            return indexer
         if self.provider == "openai":
             remote_model = os.environ.get("EMBEDDING_MODEL")
             if not remote_model:
@@ -122,6 +167,8 @@ class DatamateEmbeddings(Embeddings):
         if not batch:
             return []
         model = self._ensure_model()
+        if hasattr(model, "_encode_texts"):
+            return model._encode_texts(batch).tolist()
         if self.provider == "openai":
             return [[float(value) for value in vector] for vector in model.embed_documents(batch)]
         # `normalize_embeddings=` is deliberately not passed: in FlagEmbedding 1.4.2
@@ -154,5 +201,7 @@ def get_embedding_function() -> DatamateEmbeddings:
                     device=settings.embedding_device,
                     model=model,
                     batch_size=settings.embedding_batch,
+                    use_vllm=settings.use_vllm,
+                    gpu_memory_utilization=settings.gpu_embed_memory_util,
                 )
     return _embeddings

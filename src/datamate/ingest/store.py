@@ -46,7 +46,7 @@ from typing import Any, Sequence
 
 import polars as pl
 
-from datamate.config import Settings, load_settings
+from datamate.config import Settings, add_vllm_args, apply_env, load_settings, vllm_overrides
 from datamate.embedding import EMBEDDING_DIM
 from datamate.ingest.source import (
     LoadIssue,
@@ -1522,6 +1522,7 @@ def _main(argv: Sequence[str] | None = None) -> int:
         action="store_true",
         help="skip the per-business LLM status mapping and semantics call (offline run)",
     )
+    add_vllm_args(parser)
     arguments = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
@@ -1529,13 +1530,14 @@ def _main(argv: Sequence[str] | None = None) -> int:
     if not business_dir.is_dir():
         print(f"error  business folder not found: {business_dir}")
         return 2
-    settings = load_settings()
+    settings = load_settings(**vllm_overrides(arguments))
     if not (settings.split_dir / "data" / business_dir.name).is_dir():
         settings = replace(
             settings,
             split_dir=business_dir.parent,
             db_mode=business_dir.parent.name,
         )
+    apply_env(settings)
     store = BusinessStore(settings)
     try:
         prepared = store.ensure(business_dir.name, derive_status_map=not arguments.no_status_map)

@@ -1,0 +1,19 @@
+qid        q_001883280e83
+business   biz_128  order=0  as_of_date=2026-09-07
+question   tháng này tổng giá trị các phiếu nhập hàng là bao nhiu
+pack       sha256=3b68aa3e30e4b3f8 chars=43167 sections=11
+final_sql   SELECT IFNULL(SUM("can_tra_ncc__num"), 0)  FROM "danh_sach_nhap_hang"  WHERE "thoi_gian__date" BETWEEN '2026-09-01' AND '2026-09-07'    AND "trang_thai" = 'Đã nhập hàng'; 
+exec_status  OK  row_count=1  preview_truncated=False  abstain_reason=None
+elapsed    run=161.7s  compile=2.025s  total=163.8s  llm_calls=15
+answer     {"id": "q_001883280e83", "type": "number", "answer": 89526400}
+steps      8
+   1. extract_keywords         success    20900 ms
+   2. retrieve_entity          success    40300 ms
+   3. retrieve_context         success    52300 ms
+   4. generate_candidate       success    18100 ms
+   5. revise                   success        0 ms
+   6. generate_unit_test       success        0 ms
+   7. evaluate                 success        0 ms
+   8. execution_accuracy       success        0 ms
+rows       1 total, first 1:
+  [89526400.0]

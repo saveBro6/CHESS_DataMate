@@ -32,7 +32,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
-from datamate.config import Settings, apply_env, load_settings
+from datamate.config import Settings, add_vllm_args, apply_env, load_settings, vllm_overrides
 from datamate.context import ContextPack
 from datamate.ingest.store import BusinessStore
 from datamate.questions import Question, load_questions
@@ -636,10 +636,15 @@ def _main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--split", type=Path, default=None, help="split folder (holds questions.jsonl)")
     parser.add_argument("--limit", type=int, default=None, help="run the first N questions")
+    add_vllm_args(parser)
     arguments = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(name)s: %(message)s")
 
-    settings = load_settings(**({"split_dir": arguments.split} if arguments.split else {}))
+    overrides = vllm_overrides(arguments)
+    if arguments.split:
+        overrides["split_dir"] = arguments.split
+    settings = load_settings(**overrides)
+    apply_env(settings)
     try:
         questions = load_questions(settings.split_dir, limit=arguments.limit)
     except FileNotFoundError as exc:
