@@ -43,6 +43,8 @@ dependencies = [
     "chromadb==0.5.20",
     "openai>=1.109",
     "vllm>=0.33.0",
+    "langchain>=1.5.0",
+    "langchain-core>=1.8.1",
 ]
 
 [tool.uv]
