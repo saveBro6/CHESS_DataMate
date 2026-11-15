@@ -993,10 +993,10 @@ def _parse_status_map(
 ) -> tuple[dict[str, dict[str, list[str]]], dict[str, list[dict]]]:
     """Validate the model's grouping against the values it was given, and name the gaps."""
     cleaned = _CODE_FENCE.sub("", text.strip()).strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start < 0 or end <= start:
+    start = cleaned.find("{")
+    if start < 0:
         raise ValueError("no JSON object in the response")
-    payload = json.loads(cleaned[start : end + 1])
+    payload, _ = json.JSONDecoder().raw_decode(cleaned, start)
     if not isinstance(payload, dict):
         raise ValueError("response is not a JSON object")
     known = {key: {item["value"]: item for item in values} for key, values in candidates}
@@ -1197,10 +1197,10 @@ def _parse_semantics(
 ) -> tuple[list[str], dict[str, dict[str, list[str]]], dict[str, list[dict]]]:
     """Validate the answer against the schema it was given; never accept an invented value."""
     cleaned = _CODE_FENCE.sub("", text.strip()).strip()
-    start, end = cleaned.find("{"), cleaned.rfind("}")
-    if start < 0 or end <= start:
+    start = cleaned.find("{")
+    if start < 0:
         raise ValueError("no JSON object in the response")
-    payload = json.loads(cleaned[start : end + 1])
+    payload, _ = json.JSONDecoder().raw_decode(cleaned, start)
     if not isinstance(payload, dict):
         raise ValueError("response is not a JSON object")
 
