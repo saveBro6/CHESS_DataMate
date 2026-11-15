@@ -2,7 +2,10 @@ from typing import Any, Dict, List
 import os
 
 from langchain_core.exceptions import OutputParserException
-from langchain.output_parsers import OutputFixingParser
+try:
+    from langchain.output_parsers import OutputFixingParser
+except ImportError:
+    from langchain_classic.output_parsers import OutputFixingParser
 
 from llm.engine_configs import ENGINE_CONFIGS
 from runner.logger import Logger
