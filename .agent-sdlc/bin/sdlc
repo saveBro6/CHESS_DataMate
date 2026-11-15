@@ -1,0 +1,792 @@
+#!/usr/bin/env node
+/**
+ * sdlc — deterministic state machine for the Full Coding Lifecycle.
+ *
+ * Every transition gate in this framework is enforced HERE, not by prose in a
+ * prompt. Agents are instructed to call this binary before acting; if an agent
+ * skips a gate the next gate still refuses to open, so an out-of-order phase
+ * cannot silently corrupt a run.
+ *
+ * Exit codes: 0 ok · 1 gate blocked / usage · 3 retry budget exhausted (escalate).
+ */
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync, copyFileSync } from 'node:fs';
+import { dirname, join, resolve, relative, sep } from 'node:path';
+import { execFileSync } from 'node:child_process';
+
+const SELF = resolve(process.argv[1]);
+const FRAMEWORK_ROOT = dirname(dirname(SELF)); // .agent-sdlc
+const ROOT = dirname(FRAMEWORK_ROOT); // project root
+const MACHINE = JSON.parse(readFileSync(join(FRAMEWORK_ROOT, 'machine.json'), 'utf8'));
+const RUN_ROOT = join(ROOT, MACHINE.runRoot);
+
+const c = {
+  ok: (s) => `\x1b[32m${s}\x1b[0m`,
+  bad: (s) => `\x1b[31m${s}\x1b[0m`,
+  warn: (s) => `\x1b[33m${s}\x1b[0m`,
+  dim: (s) => `\x1b[2m${s}\x1b[0m`,
+  bold: (s) => `\x1b[1m${s}\x1b[0m`,
+};
+
+/* ------------------------------------------------------------------ helpers */
+
+const phaseById = (id) => MACHINE.phases.find((p) => p.id === id);
+const phaseByN = (n) => MACHINE.phases.find((p) => p.n === n);
+const phaseByCommand = (cmd) => MACHINE.phases.find((p) => p.command === cmd);
+const runDir = (slug) => join(RUN_ROOT, slug);
+const artifactPath = (slug, file) => join(runDir(slug), file);
+const rel = (p) => relative(ROOT, p).split(sep).join('/');
+const today = () => new Date().toISOString().slice(0, 10);
+
+
+function die(msg, code = 1) {
+  console.error(`${c.bad('[BLOCK]')} ${msg}`);
+  process.exit(code);
+}
+
+function requireRun(slug) {
+  if (!slug) die('usage: sdlc <command> <slug> ...  (run `sdlc list` to see runs)');
+  if (!existsSync(runDir(slug))) die(`unknown run "${slug}" — no directory at ${rel(runDir(slug))}`);
+  return runDir(slug);
+}
+
+/** Parse leading YAML-ish frontmatter. Flat `key: value` pairs only, by design:
+ *  artifacts stay dependency-free and every runtime can read them. */
+export function readFrontmatter(file) {
+  if (!existsSync(file)) return { data: null, body: '' };
+  const text = readFileSync(file, 'utf8');
+  const m = /^---\r?\n([\s\S]*?)\r?\n---\r?\n?/.exec(text);
+  if (!m) return { data: null, body: text };
+  const data = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    if (!line.trim() || line.trim().startsWith('#')) continue;
+    const idx = line.indexOf(':');
+    if (idx === -1) continue;
+    const key = line.slice(0, idx).trim();
+    let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    data[key] = value;
+  }
+  return { data, body: text.slice(m[0].length) };
+}
+
+/** Rewrite one frontmatter field in place, preserving every other byte. */
+function setFrontmatterField(file, field, value) {
+  const text = readFileSync(file, 'utf8');
+  const m = /^---\r?\n([\s\S]*?)\r?\n---/.exec(text);
+  if (!m) die(`${rel(file)} has no frontmatter; cannot set "${field}"`);
+  const lines = m[1].split(/\r?\n/);
+  const re = new RegExp(`^(\\s*)${field}\\s*:`);
+  let found = false;
+  const next = lines.map((line) => {
+    if (re.test(line)) {
+      found = true;
+      const indent = line.match(re)[1];
+      return `${indent}${field}: ${value}`;
+    }
+    return line;
+  });
+  if (!found) next.push(`${field}: ${value}`);
+  const rebuilt = `---\n${next.join('\n')}\n---` + text.slice(m[0].length);
+  writeFileSync(file, rebuilt);
+  // keep the human-readable marker line (if present) in sync so the two never drift
+  syncBodyMarker(file, field, value);
+}
+
+/** Artifacts carry a duplicate human-readable marker; keep it truthful. */
+function syncBodyMarker(file, field, value) {
+  const markerFor = { status: 'Status', verdict: 'VERDICT', result: 'STATUS' };
+  const label = markerFor[field];
+  if (!label) return;
+  const decorations = { status: value, verdict: `VERDICT: ${value}`, result: `STATUS: ${value}` };
+  const text = readFileSync(file, 'utf8');
+  let out = text;
+  if (field === 'status') {
+    out = out.replace(/^(\s*[-*]?\s*\*\*Status:\*\*\s*).*$/m, `$1${decorations.status}`);
+  } else {
+    // trailing standalone verdict / status line at end of document
+    const re = new RegExp(`^${label}:\\s*\\S+\\s*$`, 'm');
+    if (re.test(out)) out = out.replace(re, decorations[field]);
+  }
+  if (out !== text) writeFileSync(file, out);
+}
+
+function readState(slug) {
+  requireRun(slug);
+  const file = join(runDir(slug), 'state.json');
+  if (!existsSync(file)) die(`run "${slug}" has no state.json — recreate it with \`sdlc new\``);
+  return JSON.parse(readFileSync(file, 'utf8'));
+}
+
+function writeState(slug, state) {
+  state.updatedAt = new Date().toISOString();
+  writeFileSync(join(runDir(slug), 'state.json'), JSON.stringify(state, null, 2) + '\n');
+}
+
+function logEvent(state, event, detail) {
+  state.history = state.history || [];
+  state.history.push({ at: new Date().toISOString(), event, ...(detail ? { detail } : {}) });
+}
+
+const norm = (v) => (v === undefined || v === null ? '' : String(v).trim().toUpperCase());
+
+/* -------------------------------------------------------------------- gates */
+
+/** Check every requirement guarding entry into `phase`. */
+function checkGate(slug, phase) {
+  requireRun(slug);
+  const failures = [];
+
+  // A human checkpoint on the preceding phase closes this gate too: a phase may not
+  // start on the strength of an artifact a human has not yet signed off.
+  const prev = phaseByN(phase.n - 1);
+  if (prev?.hitlCheckpoint) {
+    const stateFile = join(runDir(slug), 'state.json');
+    const state = existsSync(stateFile) ? JSON.parse(readFileSync(stateFile, 'utf8')) : {};
+    if (!(state.hitl || {})[prev.id]) {
+      failures.push(`human checkpoint after ${prev.id} is pending → \`sdlc approve ${slug} spec\` / \`sdlc ack ${slug}\``);
+    }
+  }
+
+  for (const req of phase.requires || []) {
+    const file = artifactPath(slug, req.artifact);
+    if (!existsSync(file)) {
+      failures.push(`missing artifact ${req.artifact}`);
+      continue;
+    }
+    const { data } = readFrontmatter(file);
+    if (!data) {
+      failures.push(`${req.artifact} has no frontmatter (status is unreadable)`);
+      continue;
+    }
+    const actual = data[req.field];
+    if (norm(actual) !== norm(req.value)) {
+      failures.push(`${req.artifact} → ${req.field} is "${actual ?? '<unset>'}", gate requires "${req.value}"`);
+    }
+  }
+  return { ok: failures.length === 0, failures };
+}
+
+function assertGate(slug, phase) {
+  const { ok, failures } = checkGate(slug, phase);
+  if (!ok) {
+    console.error(`${c.bad('[BLOCK]')} transition gate for ${c.bold(phase.command || phase.id)} is closed:`);
+    for (const f of failures) console.error(`        · ${f}`);
+    console.error(c.dim(`        fix: complete the owning phase, then re-run. See \`sdlc next ${slug}\`.`));
+    process.exit(1);
+  }
+  console.log(`${c.ok('[OK]')} gate open for ${c.bold(phase.command || phase.id)}`);
+}
+
+/* ---------------------------------------------------------------- commands */
+
+function cmdNew(args) {
+  const text = args.filter((a) => !a.startsWith('--')).join(' ').trim();
+  const slugFlag = args.find((a) => a.startsWith('--slug='));
+  let slug = slugFlag ? slugFlag.split('=')[1] : text;
+  const supplied = !!slugFlag;
+  if (!slug) die('usage: sdlc new "<feature idea>" [--slug=my-feature]');
+  slug = slug
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48);
+  if (!supplied && slug.split('-').length > 6) slug = slug.split('-').slice(0, 5).join('-');
+  if (!slug) die('could not derive a slug from that input; pass --slug=<kebab-case>');
+
+  const dir = runDir(slug);
+  if (existsSync(dir)) die(`run "${slug}" already exists — resume it with \`sdlc status ${slug}\` or pass --slug=<other>`);
+  mkdirSync(dir, { recursive: true });
+
+  const first = MACHINE.phases[0];
+  const tpl = join(ROOT, MACHINE.templateRoot, first.template);
+  const tplText = readFileSync(tpl, 'utf8');
+  const rendered = tplText
+    .replaceAll('{{SLUG}}', slug)
+    .replaceAll('{{DATE}}', today())
+    .replaceAll('{{ISO}}', new Date().toISOString())
+    .replaceAll('{{IDEA}}', text || '(not supplied)');
+  writeFileSync(artifactPath(slug, first.artifact), rendered);
+
+  const state = {
+    slug,
+    idea: text || null,
+    phase: first.id,
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    retries: Object.fromEntries(MACHINE.loops.map((l) => [l.id, 0])),
+    hitl: {},
+    history: [],
+  };
+  logEvent(state, 'created', `phase=${first.id}`);
+  writeState(slug, state);
+
+  console.log(`${c.ok('[OK]')} created run ${c.bold(slug)}`);
+  console.log(`     ${rel(artifactPath(slug, first.artifact))} ${c.dim('(status: DRAFT)')}`);
+  console.log(`     next: ${c.bold(first.command)} ${slug}`);
+}
+
+function cmdList() {
+  if (!existsSync(RUN_ROOT)) {
+    console.log(c.dim(`no runs yet (${rel(RUN_ROOT)} does not exist)`));
+    return;
+  }
+  const runs = readdirSync(RUN_ROOT).filter((d) => existsSync(join(RUN_ROOT, d, 'state.json')));
+  if (!runs.length) {
+    console.log(c.dim('no runs yet — start one with: sdlc new "<feature idea>"'));
+    return;
+  }
+  const rows = runs.map((slug) => {
+    const s = readState(slug);
+    const p = phaseById(s.phase) || MACHINE.phases[0];
+    return { slug, phase: `${p.n}/${MACHINE.phases.length} ${s.phase}`, retries: s.retries, updated: s.updatedAt };
+  });
+  const w = Math.max(...rows.map((r) => r.slug.length), 4);
+  console.log(c.bold(`${'SLUG'.padEnd(w)}  PHASE                  RETRIES            UPDATED`));
+  for (const r of rows) {
+    console.log(`${r.slug.padEnd(w)}  ${r.phase.padEnd(21)}  ${String(JSON.stringify(r.retries)).padEnd(18)} ${r.updated}`);
+  }
+}
+
+function cmdStatus(args) {
+  const slug = args[0];
+  const state = readState(slug);
+  const phase = phaseById(state.phase) || MACHINE.phases[0];
+  console.log(`${c.bold(slug)}  ${c.dim(state.idea ? `— ${state.idea}` : '')}`);
+  console.log(`phase: ${c.bold(`${phase.n}/${MACHINE.phases.length} ${phase.id}`)}   retries: ${JSON.stringify(state.retries)}`);
+  console.log('');
+  for (const p of MACHINE.phases) {
+    if (!p.artifact) continue;
+    const file = artifactPath(slug, p.artifact);
+    const exists = existsSync(file);
+    const { data } = exists ? readFrontmatter(file) : { data: null };
+    const mark = !exists ? c.dim('·') : p.n < phase.n ? c.ok('✔') : p.n === phase.n ? c.warn('▶') : c.dim('·');
+    const bits = data
+      ? Object.entries(data)
+          .filter(([k]) => !['artifact', 'slug', 'owner', 'created', 'updated', 'template'].includes(k))
+          .map(([k, v]) => `${k}=${v}`)
+          .join('  ')
+      : c.dim('missing');
+    console.log(` ${mark} ${p.artifact.padEnd(20)} ${exists ? bits : c.dim('—')}`);
+  }
+  const hitl = Object.entries(state.hitl || {}).filter(([, v]) => v).map(([k]) => k);
+  if (hitl.length) console.log(`\n${c.dim('human checkpoints acknowledged:')} ${hitl.join(', ')}`);
+}
+
+function cmdGate(args) {
+  const [slug, target] = args;
+  requireRun(slug);
+  const phase = phaseById(target) || phaseByCommand(target ? (target.startsWith('/') ? target : `/${target}`) : '');
+  if (!phase) die(`unknown phase "${target}" — one of: ${MACHINE.phases.map((p) => p.id).join(', ')}`);
+  assertGate(slug, phase);
+}
+
+function cmdApprove(args) {
+  const [slug, what] = args;
+  requireRun(slug);
+  const map = { spec: '01-spec.md', plan: '02-plan.md' };
+  const artifact = map[what];
+  if (!artifact) die('usage: sdlc approve <slug> <spec|plan>');
+  const file = artifactPath(slug, artifact);
+  if (!existsSync(file)) die(`${artifact} does not exist yet — run the owning phase first`);
+  if (what === 'spec') {
+    setFrontmatterField(file, 'status', 'APPROVED');
+    const state = readState(slug);
+    state.hitl = state.hitl || {};
+    state.hitl.brainstorm = true;
+    logEvent(state, 'spec-approved');
+    writeState(slug, state);
+    console.log(`${c.ok('[OK]')} 01-spec.md → APPROVED ${c.dim('(checkpoint brainstorm acknowledged; /plan gate is now open)')}`);
+  } else {
+    const state = readState(slug);
+    state.hitl = state.hitl || {};
+    state.hitl.plan = true;
+    logEvent(state, 'plan-acknowledged');
+    writeState(slug, state);
+    console.log(`${c.ok('[OK]')} plan checkpoint acknowledged ${c.dim('(/execute gate is open)')}`);
+  }
+}
+
+function cmdSet(args) {
+  const [slug, artifact, assignment] = args;
+  requireRun(slug);
+  if (!assignment || !assignment.includes('=')) die('usage: sdlc set <slug> <artifact-file> <field>=<value>');
+  const file = artifactPath(slug, artifact);
+  if (!existsSync(file)) die(`${artifact} does not exist`);
+  const idx = assignment.indexOf('=');
+  const field = assignment.slice(0, idx);
+  const value = assignment.slice(idx + 1);
+  setFrontmatterField(file, field, value);
+  console.log(`${c.ok('[OK]')} ${artifact} → ${field}=${value}`);
+}
+
+function cmdAdvance(args) {
+  const slug = args[0];
+  const state = readState(slug);
+  const cur = phaseById(state.phase) || MACHINE.phases[0];
+  if (cur.id === 'done') die('run is already complete');
+
+  const next = phaseByN(cur.n + 1);
+  const { ok, failures } = checkGate(slug, next);
+  if (!ok) {
+    console.error(`${c.bad('[BLOCK]')} cannot advance ${cur.id} → ${next.id}:`);
+    for (const f of failures) console.error(`        · ${f}`);
+    process.exit(1);
+  }
+  if (cur.hitlCheckpoint && !(state.hitl || {})[cur.id]) {
+    die(`human checkpoint after ${cur.id} is pending — a human must confirm, then run \`sdlc ack ${slug}\`.\n        ${cur.checkpoint || ''}`);
+  }
+  state.phase = next.id;
+  logEvent(state, 'advanced', `${cur.id} → ${next.id}`);
+  writeState(slug, state);
+  console.log(`${c.ok('[OK]')} ${cur.id} → ${c.bold(next.id)}`);
+  if (next.command) console.log(`     next: ${c.bold(next.command)} ${slug}`);
+}
+
+function cmdAck(args) {
+  const slug = args[0];
+  const state = readState(slug);
+  // With no explicit phase, acknowledge the last checkpoint whose artifact actually exists —
+  // not merely the current phase, which may not have been advanced yet.
+  const produced = MACHINE.phases.filter(
+    (p) => p.hitlCheckpoint && p.artifact && existsSync(artifactPath(slug, p.artifact)),
+  );
+  const phase = args[1] ? phaseById(args[1]) : produced[produced.length - 1];
+  if (!phase) die('no phase with a completed artifact to acknowledge — run the phase first');
+  if (!phase.hitlCheckpoint) die(`${phase.id} has no human checkpoint`);
+  state.hitl = state.hitl || {};
+  state.hitl[phase.id] = true;
+  logEvent(state, 'hitl-ack', phase.id);
+  writeState(slug, state);
+  console.log(`${c.ok('[OK]')} human checkpoint acknowledged after ${phase.id}`);
+}
+
+function cmdLoop(args) {
+  const [slug, loopId] = args;
+  const state = readState(slug);
+  const loop = MACHINE.loops.find((l) => l.id === loopId);
+  if (!loop) die(`unknown loop "${loopId}" — one of: ${MACHINE.loops.map((l) => l.id).join(', ')}`);
+
+  const file = artifactPath(slug, loop.onArtifact);
+  if (!existsSync(file)) die(`${loop.onArtifact} does not exist — nothing to loop on`);
+  const { data } = readFrontmatter(file);
+  if (norm(data?.[loop.field]) !== norm(loop.retryValue)) {
+    console.log(c.dim(`${loop.onArtifact} → ${loop.field}=${data?.[loop.field]} is not "${loop.retryValue}"; no loop needed`));
+    return;
+  }
+
+  const used = (state.retries || {})[loop.id] || 0;
+  if (used >= loop.maxRetries) {
+    state.escalated = { loop: loop.id, at: new Date().toISOString(), reason: 'retry budget exhausted' };
+    logEvent(state, 'escalated', loop.id);
+    writeState(slug, state);
+    console.error(`${c.bad('[ESCALATE]')} ${loop.label}: retry budget exhausted (${used}/${loop.maxRetries}).`);
+    console.error(`        Automated retries are exhausted. A human must intervene:`);
+    console.error(`        1. read ${rel(file)}`);
+    console.error(`        2. decide: narrow the plan, change the spec, or take over manually`);
+    console.error(`        3. when resolved, reset the budget with \`sdlc reset-retries ${slug} ${loop.id}\``);
+    process.exit(3);
+  }
+
+  state.retries[loop.id] = used + 1;
+  state.phase = loop.targetPhase;
+  if (loop.resetArtifact) {
+    const target = artifactPath(slug, loop.resetArtifact.artifact);
+    if (existsSync(target)) setFrontmatterField(target, loop.resetArtifact.field, loop.resetArtifact.value);
+  }
+  logEvent(state, 'loop-retry', `${loop.id} #${used + 1}`);
+  writeState(slug, state);
+  console.log(`${c.ok('[OK]')} ${loop.label}: retry ${used + 1}/${loop.maxRetries} — phase reset to ${c.bold(loop.targetPhase)}`);
+  console.log(`     remaining budget: ${loop.maxRetries - used - 1}`);
+  console.log(`     next: ${c.bold('/execute')} ${slug}`);
+}
+
+function cmdResetRetries(args) {
+  const [slug, loopId] = args;
+  const state = readState(slug);
+  if (loopId) {
+    if (!(state.retries || {})[loopId] && state.retries?.[loopId] !== 0) die(`unknown loop "${loopId}"`);
+    state.retries[loopId] = 0;
+  } else {
+    state.retries = Object.fromEntries(MACHINE.loops.map((l) => [l.id, 0]));
+  }
+  delete state.escalated;
+  logEvent(state, 'retries-reset', loopId || 'all');
+  writeState(slug, state);
+  console.log(`${c.ok('[OK]')} retry budget reset ${c.dim(JSON.stringify(state.retries))}`);
+}
+
+function cmdNext(args) {
+  const slug = args[0];
+  const state = readState(slug);
+  const phase = phaseById(state.phase) || MACHINE.phases[0];
+
+  if (phase.id === 'done') {
+    console.log(`${c.ok('[DONE]')} ${slug} completed the lifecycle.`);
+    return;
+  }
+  const gate = checkGate(slug, phase);
+  console.log(`${c.bold(slug)} · phase ${phase.n}/${MACHINE.phases.length} · ${c.bold(phase.id)}`);
+  if (!gate.ok) {
+    console.log(`${c.bad('[BLOCKED]')} cannot run ${phase.command}:`);
+    for (const f of gate.failures) console.log(`          · ${f}`);
+    const prev = phaseByN(phase.n - 1);
+    if (prev?.command) console.log(`          resume with: ${c.bold(prev.command)} ${slug}`);
+    return;
+  }
+
+  // pending human checkpoint on the current phase?
+  const art = phase.artifact ? readFrontmatter(artifactPath(slug, phase.artifact)) : { data: null };
+  if (phase.hitlCheckpoint && phase.id === 'brainstorm' && norm(art.data?.status) !== 'APPROVED') {
+    console.log(`${c.warn('[HITL]')} spec written (status=${art.data?.status}). Human review required:`);
+    console.log(`       1. read ${rel(artifactPath(slug, phase.artifact))}`);
+    console.log(`       2. ${c.bold(`bin/sdlc approve ${slug} spec`)}`);
+    console.log(`       3. ${c.bold('/plan')} ${slug}`);
+    return;
+  }
+  if (phase.hitlCheckpoint && phase.id === 'plan' && !(state.hitl || {}).plan) {
+    console.log(`${c.warn('[HITL]')} plan written. Human review required before code is written:`);
+    console.log(`       1. read ${rel(artifactPath(slug, phase.artifact))}`);
+    console.log(`       2. ${c.bold(`bin/sdlc ack ${slug}`)}`);
+    console.log(`       3. ${c.bold('/execute')} ${slug}`);
+    return;
+  }
+
+  // loop conditions on the current artifact
+  for (const loop of MACHINE.loops) {
+    if (loop.onArtifact !== phase.artifact) continue;
+    if (norm(art.data?.[loop.field]) !== norm(loop.retryValue)) continue;
+    const used = (state.retries || {})[loop.id] || 0;
+    console.log(`${c.warn('[LOOP]')} ${loop.label} triggered (${loop.field}=${loop.retryValue}, used ${used}/${loop.maxRetries})`);
+    console.log(`       ${c.bold(`bin/sdlc loop ${slug} ${loop.id}`)}  → then ${c.bold('/execute')} ${slug}`);
+    return;
+  }
+
+  // the current phase already satisfied the next phase's gate → just advance
+  const next = phaseByN(phase.n + 1);
+  if (next && checkGate(slug, next).ok) {
+    console.log(`${c.ok('[ADVANCE]')} ${phase.id} is complete — ${c.bold(`bin/sdlc advance ${slug}`)} → ${next.command || next.id}`);
+    return;
+  }
+
+  if (phase.command) {
+    console.log(`${c.ok('[READY]')} run ${c.bold(phase.command)} ${slug}`);
+    console.log(c.dim(`         persona: ${MACHINE.agentRoot}/${phase.agent}.md`));
+  }
+}
+
+/* ------------------------------------------------------- scope enforcement */
+
+const EXEMPT = (MACHINE.scope?.exemptPaths || []).map(globToRe);
+
+function globToRe(pattern) {
+  let out = '';
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (ch === '*') {
+      if (pattern[i + 1] === '*') {
+        const slash = pattern[i + 2] === '/';
+        out += slash ? '(?:.*/)?' : '.*';
+        i += slash ? 2 : 1;
+      } else {
+        out += '[^/]*';
+      }
+    } else if (ch === '?') out += '[^/]';
+    else out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  }
+  return new RegExp(`^${out}$`);
+}
+
+const matchesAny = (path, res) => res.some((re) => re.test(path));
+
+function isExempt(path) {
+  if (matchesAny(path, EXEMPT)) return true;
+  return matchesAny(path, (MACHINE.scope?.testFilePatterns || []).map(globToRe));
+}
+
+/** Parse `### T<id> — title` blocks out of 02-plan.md, collecting declared file ops. */
+function parsePlanTasks(slug) {
+  const file = artifactPath(slug, '02-plan.md');
+  if (!existsSync(file)) die('02-plan.md does not exist');
+  const text = readFileSync(file, 'utf8');
+  const tasks = [];
+  const headingRe = /^###\s+(T\d+)\b.*$/gm;
+  const marks = [...text.matchAll(headingRe)];
+  marks.forEach((m, i) => {
+    const start = m.index;
+    const end = i + 1 < marks.length ? marks[i + 1].index : text.length;
+    const section = text.slice(start, end);
+    const files = [...section.matchAll(/^\s*[-*]\s*(create|modify|delete)\s*:\s*`?([^`\n]+?)`?\s*$/gm)].map((mm) => ({
+      op: mm[1],
+      path: mm[2].trim(),
+    }));
+    const depends = /^\s*[-*]?\s*\*\*Depends on:\*\*\s*(.*)$/m.exec(section);
+    tasks.push({
+      id: m[1],
+      title: m[0].replace(/^###\s+/, ''),
+      files,
+      dependsOn: depends ? depends[1].replace(/`/g, '').trim() : '',
+      done: /^\s*[-*]\s*\[x\]/m.test(section),
+    });
+  });
+  return tasks;
+}
+
+function changedPaths() {
+  const gitDir = join(ROOT, '.git');
+  if (existsSync(gitDir)) {
+    const out = execFileSync('git', ['-C', ROOT, 'status', '--porcelain'], { encoding: 'utf8' });
+    const paths = new Set();
+    for (const line of out.split('\n')) {
+      if (!line.trim()) continue;
+      const body = line.slice(3).trim();
+      const arrow = body.indexOf(' -> ');
+      paths.add(arrow === -1 ? body : body.slice(arrow + 4));
+    }
+    return { source: 'git', paths: [...paths].map(stripQuotes) };
+  }
+  const baselineFile = join(RUN_ROOT, '.baseline');
+  if (!existsSync(baselineFile)) return { source: 'none', paths: [] };
+  const baseline = Number(readFileSync(baselineFile, 'utf8'));
+  const paths = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      const r = rel(full);
+      if (isExempt(r) || entry.name === '.git') continue;
+      if (entry.isDirectory()) walk(full);
+      else if (statSync(full).mtimeMs > baseline) paths.push(r);
+    }
+  };
+  walk(ROOT);
+  return { source: 'baseline', paths };
+}
+
+function stripQuotes(p) {
+  return p.replace(/^"|"$/g, '');
+}
+
+function cmdSnapshot(args) {
+  const slug = args[0];
+  requireRun(slug);
+  const gitDir = join(ROOT, '.git');
+  if (existsSync(gitDir)) {
+    console.log(`${c.dim('repository detected — scope checks use `git status`; snapshot not needed')}`);
+    return;
+  }
+  mkdirSync(RUN_ROOT, { recursive: true });
+  writeFileSync(join(RUN_ROOT, '.baseline'), String(Date.now()));
+  console.log(`${c.ok('[OK]')} baseline timestamp written for ${slug} ${c.dim('(non-git mode)')}`);
+}
+
+function cmdScope(args) {
+  const slug = args[0];
+  const taskId = args.find((a) => !a.startsWith('--') && a !== slug);
+  requireRun(slug);
+  // Deliberately not gated: /execute runs this after every single task, i.e. long before the
+  // review gate can open. A scope audit is evidence-gathering, not a transition.
+
+  const tasks = parsePlanTasks(slug);
+  if (!tasks.length) die('no tasks found in 02-plan.md (expected `### T1 …` headings)');
+  const selected = taskId ? tasks.filter((t) => t.id === taskId) : tasks;
+  if (!selected.length) die(`task "${taskId}" not found in 02-plan.md (have: ${tasks.map((t) => t.id).join(', ')})`);
+
+  const allowed = new Set();
+  for (const t of selected) for (const f of t.files) allowed.add(f.path);
+
+  const { source, paths } = changedPaths();
+  if (source === 'none') {
+    console.log(`${c.warn('[SKIP]')} not a git repo and no baseline snapshot — run \`sdlc snapshot ${slug}\` before /execute.`);
+    return;
+  }
+  const outOfScope = paths.filter((p) => !isExempt(p) && !allowed.has(p));
+  const declared = [...allowed];
+
+  console.log(`${c.bold('scope audit')} ${slug}${taskId ? ` · ${taskId}` : ' · all tasks'} ${c.dim(`(${source})`)}`);
+  console.log(` declared: ${declared.length ? declared.join(', ') : c.dim('none')}`);
+  console.log(` changed : ${paths.length ? paths.join(', ') : c.dim('none')}`);
+  if (outOfScope.length) {
+    console.error(`${c.bad('[BLOCK]')} ${outOfScope.length} change(s) outside the approved plan scope:`);
+    for (const p of outOfScope) console.error(`        · ${p}`);
+    console.error(c.dim('        the Implementation Engineer may not refactor beyond 02-plan.md (see agents/…#scope-rules)'));
+    process.exit(1);
+  }
+  console.log(`${c.ok('[OK]')} every change is inside the plan scope`);
+}
+
+/* ---------------------------------------------------------------- validate */
+
+function cmdValidate(args) {
+  const slug = args[0];
+  const state = readState(slug);
+  const problems = [];
+  const notes = [];
+
+  for (const p of MACHINE.phases) {
+    if (!p.artifact) continue;
+    const file = artifactPath(slug, p.artifact);
+    if (!existsSync(file)) continue;
+    const { data, body } = readFrontmatter(file);
+    if (!data) {
+      problems.push(`${p.artifact}: missing frontmatter`);
+      continue;
+    }
+    if (data.artifact && data.artifact !== p.artifact.replace(/\.md$/, '')) {
+      problems.push(`${p.artifact}: frontmatter artifact="${data.artifact}" does not match filename`);
+    }
+    if (data.slug && data.slug !== slug) {
+      problems.push(`${p.artifact}: frontmatter slug="${data.slug}" does not match run "${slug}"`);
+    }
+    if (p.id === 'review' && data.verdict) {
+      const trailing = /VERDICT:\s*([A-Z_]+)/g;
+      const all = [...body.matchAll(trailing)].map((m) => m[1]);
+      const last = all[all.length - 1];
+      if (last && norm(last) !== norm(data.verdict)) {
+        problems.push(`04-review.md: frontmatter verdict="${data.verdict}" but concluding line says "${last}"`);
+      }
+      if (!last) problems.push('04-review.md: no concluding `VERDICT:` line');
+    }
+    if (p.id === 'test' && data.result) {
+      const trailing = [...body.matchAll(/STATUS:\s*([A-Z_]+)/g)].map((m) => m[1]);
+      const last = trailing[trailing.length - 1];
+      if (last && norm(last) !== norm(data.result)) {
+        problems.push(`05-test-report.md: frontmatter result="${data.result}" but concluding line says "${last}"`);
+      }
+    }
+  }
+
+  // plan task accounting
+  if (existsSync(artifactPath(slug, '02-plan.md'))) {
+    const tasks = parsePlanTasks(slug);
+    const plan = readFrontmatter(artifactPath(slug, '02-plan.md')).data || {};
+    if (plan.tasks_total && Number(plan.tasks_total) !== tasks.length) {
+      problems.push(`02-plan.md: tasks_total=${plan.tasks_total} but ${tasks.length} task headings found`);
+    }
+    const done = tasks.filter((t) => t.done).length;
+    if (plan.tasks_done && Number(plan.tasks_done) !== done) {
+      notes.push(`02-plan.md: tasks_done=${plan.tasks_done} but ${done} checked task(s) in body`);
+    }
+    // DAG sanity: unknown dependencies
+    const ids = new Set(tasks.map((t) => t.id));
+    for (const t of tasks) {
+      if (!t.dependsOn || /^(none|-|—)$/i.test(t.dependsOn)) continue;
+      for (const dep of t.dependsOn.split(/[,\s]+/).filter((x) => /^T\d+$/.test(x))) {
+        if (!ids.has(dep)) problems.push(`02-plan.md: ${t.id} depends on ${dep}, which does not exist`);
+      }
+    }
+  }
+
+  const phase = phaseById(state.phase);
+  notes.push(`current phase: ${phase?.id ?? state.phase}`);
+  for (const n of notes) console.log(c.dim(`note · ${n}`));
+  if (problems.length) {
+    for (const p of problems) console.error(`${c.bad('[DRIFT]')} ${p}`);
+    process.exit(1);
+  }
+  console.log(`${c.ok('[OK]')} ${slug}: artifacts are internally consistent`);
+}
+
+function cmdDoctor() {
+  const problems = [];
+  const machine = MACHINE;
+  for (const p of machine.phases) {
+    if (p.template && !existsSync(join(ROOT, machine.templateRoot, p.template))) {
+      problems.push(`missing template ${machine.templateRoot}/${p.template}`);
+    }
+    if (p.agent && !existsSync(join(ROOT, machine.agentRoot, `${p.agent}.md`))) problems.push(`missing agent persona ${p.agent}.md`);
+  }
+  for (const l of machine.loops) {
+    if (!machine.phases.some((p) => p.id === l.targetPhase)) problems.push(`loop ${l.id} targets unknown phase ${l.targetPhase}`);
+  }
+  // command definitions ↔ machine phases
+  const cmdDir = join(FRAMEWORK_ROOT, 'commands');
+  if (existsSync(cmdDir)) {
+    const files = readdirSync(cmdDir).filter((f) => f.endsWith('.md'));
+    for (const p of machine.phases) {
+      if (!p.command) continue;
+      const name = p.command.slice(1);
+      if (!files.includes(`${name}.md`) && !files.includes(`${name}.md`) && !files.some((f) => f === `${name}.md`)) {
+        problems.push(`no command definition for ${p.command} (expected commands/${name}.md)`);
+      }
+    }
+  } else problems.push('missing commands/ directory');
+
+  // adapter freshness
+  try {
+    execFileSync(process.execPath, [join(FRAMEWORK_ROOT, 'bin', 'sdlc-sync'), '--check'], { stdio: 'pipe' });
+    console.log(`${c.ok('[OK]')} generated adapters are in sync`);
+  } catch (err) {
+    problems.push('generated adapters are stale — run: bin/sdlc-sync');
+    if (err.stdout) process.stdout.write(err.stdout.toString());
+  }
+
+  if (!existsSync(join(ROOT, '.dsh', 'skills'))) problems.push('missing .dsh/skills (native `/` commands will not appear)');
+
+  if (problems.length) {
+    for (const p of problems) console.error(`${c.bad('[FAIL]')} ${p}`);
+    process.exit(1);
+  }
+  console.log(`${c.ok('[OK]')} framework is healthy — ${machine.phases.length} phases, ${machine.loops.length} retry loops`);
+}
+
+/* -------------------------------------------------------------------- main */
+
+function help() {
+  console.log(`${c.bold('sdlc')} — Full Coding Lifecycle state machine
+
+${c.bold('lifecycle')}
+  new "<idea>" [--slug=x]     create a run from the spec template
+  list                        list runs and their phase
+  status <slug>               per-artifact status table
+  next <slug>                 the single next action (blocked / HITL / command)
+
+${c.bold('gates')}
+  gate <slug> <phase>         exit 0 only if the gate opens
+  advance <slug>              move to the next phase (enforces gate + human checkpoint)
+  approve <slug> <spec|plan>  record a human approval
+  ack <slug> [phase]          acknowledge a human checkpoint
+  set <slug> <artifact> <field>=<value>   write an artifact frontmatter field
+  validate <slug>             detect drift between frontmatter, body markers, and the plan
+
+${c.bold('loops')}
+  loop <slug> <review|test>   spend one retry; exit 3 when the budget is exhausted
+  reset-retries <slug> [loop] reset the retry budget after human intervention
+
+${c.bold('scope')}
+  snapshot <slug>             baseline for non-git projects
+  scope <slug> [task-id]      fail if changed files fall outside the plan
+
+${c.bold('housekeeping')}
+  doctor                      check the installation and adapter freshness
+`);
+}
+
+const COMMANDS = {
+  new: cmdNew,
+  list: cmdList,
+  status: cmdStatus,
+  next: cmdNext,
+  gate: cmdGate,
+  advance: cmdAdvance,
+  approve: cmdApprove,
+  ack: cmdAck,
+  set: cmdSet,
+  validate: cmdValidate,
+  loop: cmdLoop,
+  'reset-retries': cmdResetRetries,
+  snapshot: cmdSnapshot,
+  scope: cmdScope,
+  doctor: cmdDoctor,
+  help,
+  '--help': help,
+};
+
+const [cmd, ...rest] = process.argv.slice(2);
+if (!cmd || cmd === '-h') {
+  help();
+  process.exit(0);
+}
+const fn = COMMANDS[cmd];
+if (!fn) die(`unknown command "${cmd}" — try \`sdlc help\``);
+fn(rest);

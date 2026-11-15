@@ -1,0 +1,91 @@
+---
+name: sdlc
+description: "Pipeline controller — run brainstorm → plan → execute → review → test → improve end to end, with capped retry loops and two human checkpoints."
+whenToUse: "You want the full lifecycle driven automatically from a single feature description, pausing only at spec and plan approval."
+argument-hint: "<feature description>"
+allowed-tools: "Read, Grep, Glob, Edit, Write, Bash(*)"
+agent: pipeline-controller
+phase: sdlc
+---
+
+# /sdlc — Full Pipeline Controller
+
+Input: `$ARGUMENTS` — a feature description. You are the **controller**, not a worker: you never
+write production code or review artifacts yourself. You sequence phases, enforce gates, and stop
+at the two designated human checkpoints.
+
+## The loop you must execute
+
+```
+brainstorm → [HITL: spec approve] → plan → [HITL: plan ack] → execute
+   ↑                                                              │
+   │                                                              ▼
+   └──── /improve ← test ←── (retry ≤3) ── review ←──────────────┘
+```
+
+## Procedure
+
+```bash
+bin/sdlc new "$ARGUMENTS"
+SLUG=$(bin/sdlc list | tail -1 | awk '{print $1}')     # or read it from the printed output
+```
+
+Then repeat this control loop until `bin/sdlc next $SLUG` says `[DONE]`:
+
+```bash
+bin/sdlc next $SLUG
+```
+
+and act on the **single** thing it prints:
+
+| Output | Action |
+|---|---|
+| `[READY] run /x` | Load `.agent-sdlc/commands/x.md` and execute that phase exactly as written (including its delegation rules), then `bin/sdlc advance $SLUG` if it completed |
+| `[HITL]` | **Stop the pipeline.** Summarise, ask the human, and end your turn. Resume only on their explicit go-ahead + `bin/sdlc approve`/`ack` |
+| `[LOOP]` | `bin/sdlc loop $SLUG <review\|test>` and continue with `/execute` |
+| `[BLOCKED]` | Fix the cause (a missing/incorrect artifact), never the gate. If you cannot, stop and report |
+| `[DONE]` | Report and finish |
+
+## The two human checkpoints (hard stops)
+
+1. **After `01-spec.md`** — you must not choose the architecture on the human's behalf.
+   Present: chosen option in one sentence, the trade-off matrix digest, open questions, and the
+   edge/out-of-scope lists. Wait for `bin/sdlc approve $SLUG spec`.
+2. **After `02-plan.md`** — you must not start writing code on an unread plan.
+   Present: task count, critical path, files to be created/modified/deleted, and the acceptance
+   criteria mapping. Wait for `bin/sdlc ack $SLUG`.
+
+Never acknowledge a checkpoint yourself. Never batch two phases into one message to save a
+round trip; the checkpoints exist precisely so a human can catch a wrong direction while it is
+still cheap.
+
+## Retry discipline
+
+Both loops are capped at **3** (`machine.json → loops[].maxRetries`). On `[ESCALATE]`:
+
+1. stop all automation,
+2. summarise the recurring failure in ≤10 lines (what keeps failing, what was tried),
+3. name the two real options — narrow the plan, or revisit the spec,
+4. hand control to the human.
+
+A fourth attempt is not "persistence"; it is burning budget on a design problem.
+
+## Context discipline (why this stays cheap)
+
+Each phase runs in its own child context seeded only with its persona + its inputs. You, the
+controller, hold the **state machine and the summaries**, never the file bodies, diffs, or test
+logs. Anything a later phase needs must be written into `.sdlc/runs/$SLUG/` — if it is not on
+disk, it did not happen.
+
+## Final report
+
+When done, print: slug, phase timeline with retry counts, files created/modified, verification
+status (lint/typecheck/build/tests with real numbers), findings closed from review, refactors
+applied, and proposed rule updates awaiting approval.
+
+## Anti-patterns (each one fails the run)
+
+- Editing `AGENTS.md` or flipping `APPROVED`/`PASS` to get unstuck.
+- Skipping `/review` because "the tests will catch it". Tests prove behaviour, review proves intent.
+- Letting `/execute` refactor freely because "the plan was vague".
+- Reporting success without a real verification command in the transcript.

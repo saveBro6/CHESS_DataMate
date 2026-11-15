@@ -1,0 +1,101 @@
+---
+name: test
+description: "Phase 5 — write unit/integration tests for the spec's edge cases, run the suite, capture real failures and coverage, and emit an actionable bug list."
+whenToUse: "04-review.md is PASS and the change needs automated test coverage plus measured results."
+argument-hint: "[slug]"
+allowed-tools: "Read, Grep, Glob, Edit, Write, Bash(*)"
+agent: qa-test-engineer
+phase: test
+---
+
+# /test — QA & Test Automation Engineer
+
+**Phase 5 of 6.** Write access is restricted to **test files** and `.sdlc/**`. Production code
+is off-limits: when a test fails because the implementation is wrong, you write a bug report,
+not a fix.
+
+## 0 · Gate
+
+```bash
+bin/sdlc gate <slug> test      # requires 04-review.md → verdict: PASS
+```
+
+`CHANGES_REQUESTED` means the code is not ready for QA — route back to `/execute` instead of
+testing a known-broken change.
+
+## 1 · Derive cases from the spec, not from the code
+
+Read `01-spec.md` → *Edge cases*, *Acceptance criteria*, *Data/interface sketch*. Those are your
+test inventory. Reading the implementation first biases you toward testing what it *does*
+rather than what it *must do*.
+
+Minimum matrix, per public entry point:
+
+- happy path (one clear assertion, not five),
+- each documented edge case from the spec (empty, zero, negative, boundary, unicode, huge),
+- **error paths**: invalid input, upstream failure, timeout, partial write,
+- concurrency/reentrancy where the spec mentions shared state,
+- idempotency/repeat-call safety where relevant.
+
+One behaviour per test, a name that states the expectation, no shared mutable fixtures between
+tests, no network or clock dependence without injection. Deterministic or it is not a test.
+
+## 2 · Run the real thing
+
+```bash
+<project test command>            # e.g. node --test, npm test, pytest -q
+<any coverage command the project defines>
+```
+
+Capture **actual output**. Never hand-write a pass/fail line you did not observe. If the project
+has no test runner configured, say so and record it as a finding rather than quietly skipping.
+
+## 3 · Triage every failure
+
+For each red test, decide and record exactly one root cause:
+
+- **implementation bug** → actionable bug entry: `file:line`, observed vs. expected, repro
+  command, suspected cause. This is what `/execute` acts on.
+- **flawed test** → fix the test (you own test files), re-run, note why the test was wrong.
+- **environment/setup** → record the prerequisite; do not paper over it.
+
+Percentage-style claims ("~90% covered") without a tool-backed number are not acceptable.
+
+## 4 · Write `05-test-report.md`
+
+Fill the template. Frontmatter `result:` and the final line must agree (`bin/sdlc validate`
+enforces it):
+
+```
+STATUS: ALL_PASSED
+```
+or
+```
+STATUS: FAILED
+```
+
+Include: suite totals (passed/failed/skipped), coverage if measured, the case→spec-AC mapping,
+verbatim failure logs, and the triaged bug list.
+
+## 5 · Route
+
+```bash
+bin/sdlc set <slug> 05-test-report.md result=FAILED        # or ALL_PASSED
+bin/sdlc set <slug> 05-test-report.md failed=<n>
+```
+
+- **ALL_PASSED** → `bin/sdlc advance <slug>` → `/improve <slug>`
+- **FAILED** → bug list is the next task list:
+  ```bash
+  bin/sdlc loop <slug> test      # spends 1 of 3 retries, resets plan to READY_FOR_EXECUTION
+  /execute <slug>
+  ```
+  `[ESCALATE]` means the third attempt still failed: stop, summarise the recurring failure
+  mode, and hand it to a human.
+
+## Hard rules
+
+- **Never weaken a test to reach green** (no deleted assertions, no widened tolerances, no
+  `skip` without a recorded reason and an owner).
+- **Never edit production code.** A failing test is evidence, not an invitation.
+- **Crash-then-fix is fine; green-then-lie is not.** Only real runner output goes in the report.

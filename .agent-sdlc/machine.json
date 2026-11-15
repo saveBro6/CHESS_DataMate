@@ -1,0 +1,119 @@
+{
+  "$comment": "Single source of truth for the SDLC state machine. Read by bin/sdlc (enforcement) and bin/sdlc-sync (command generation). Do not duplicate gate rules in prose only.",
+  "version": "1.0.0",
+  "runRoot": ".sdlc/runs",
+  "agentRoot": ".agent-sdlc/agents",
+  "templateRoot": ".agent-sdlc/templates",
+  "scope": {
+    "exemptPaths": [
+      ".sdlc/**",
+      ".agent-sdlc/**",
+      ".dsh/**",
+      ".claude/**",
+      ".cursor/**",
+      ".opencode/**",
+      "node_modules/**",
+      ".git/**"
+    ],
+    "testFilePatterns": ["**/*.test.js", "**/*.test.ts", "**/test/**", "**/tests/**", "**/__tests__/**", "**/*.spec.js", "**/*.spec.ts"]
+  },
+  "phases": [
+    {
+      "id": "brainstorm",
+      "n": 1,
+      "command": "/brainstorm",
+      "agent": "product-system-architect",
+      "artifact": "01-spec.md",
+      "template": "01-spec.md",
+      "requires": [],
+      "produces": { "status": "DRAFT" },
+      "hitlCheckpoint": true,
+      "checkpoint": "Read 01-spec.md, answer/approve the open questions, then run `bin/sdlc approve <slug> spec`."
+    },
+    {
+      "id": "plan",
+      "n": 2,
+      "command": "/plan",
+      "agent": "tech-lead-planner",
+      "artifact": "02-plan.md",
+      "template": "02-plan.md",
+      "requires": [{ "artifact": "01-spec.md", "field": "status", "value": "APPROVED" }],
+      "produces": { "status": "READY_FOR_EXECUTION" },
+      "hitlCheckpoint": true,
+      "checkpoint": "Read 02-plan.md (task DAG + file scope) before any code is written."
+    },
+    {
+      "id": "execute",
+      "n": 3,
+      "command": "/execute",
+      "agent": "senior-implementation-engineer",
+      "artifact": "03-execution.md",
+      "template": "03-execution.md",
+      "requires": [{ "artifact": "02-plan.md", "field": "status", "value": "READY_FOR_EXECUTION" }],
+      "produces": { "status": "IN_PROGRESS" }
+    },
+    {
+      "id": "review",
+      "n": 4,
+      "command": "/review",
+      "agent": "adversarial-code-reviewer",
+      "artifact": "04-review.md",
+      "template": "04-review.md",
+      "requires": [{ "artifact": "03-execution.md", "field": "status", "value": "COMPLETE" }],
+      "produces": { "status": "COMPLETE", "verdict": "CHANGES_REQUESTED" }
+    },
+    {
+      "id": "test",
+      "n": 5,
+      "command": "/test",
+      "agent": "qa-test-engineer",
+      "artifact": "05-test-report.md",
+      "template": "05-test-report.md",
+      "requires": [{ "artifact": "04-review.md", "field": "verdict", "value": "PASS" }],
+      "produces": { "status": "COMPLETE", "result": "FAILED" }
+    },
+    {
+      "id": "improve",
+      "n": 6,
+      "command": "/improve",
+      "agent": "principal-refactorer",
+      "artifact": "06-improve.md",
+      "template": "06-improve.md",
+      "requires": [{ "artifact": "05-test-report.md", "field": "result", "value": "ALL_PASSED" }],
+      "produces": { "status": "PROPOSED" }
+    },
+    {
+      "id": "done",
+      "n": 7,
+      "command": null,
+      "agent": null,
+      "artifact": null,
+      "template": null,
+      "requires": [{ "artifact": "06-improve.md", "field": "status", "value": "COMPLETE" }],
+      "produces": {}
+    }
+  ],
+  "loops": [
+    {
+      "id": "review",
+      "label": "execute <-> review",
+      "onArtifact": "04-review.md",
+      "field": "verdict",
+      "retryValue": "CHANGES_REQUESTED",
+      "targetPhase": "execute",
+      "resetArtifact": { "artifact": "02-plan.md", "field": "status", "value": "READY_FOR_EXECUTION" },
+      "maxRetries": 3
+    },
+    {
+      "id": "test",
+      "label": "execute <-> test",
+      "onArtifact": "05-test-report.md",
+      "field": "result",
+      "retryValue": "FAILED",
+      "targetPhase": "execute",
+      "resetArtifact": { "artifact": "02-plan.md", "field": "status", "value": "READY_FOR_EXECUTION" },
+      "maxRetries": 3
+    }
+  ],
+  "defaultChecks": ["lint", "typecheck", "build"]
+}
