@@ -3,13 +3,13 @@ name = "chess-datamate"
 version = "0.1.0"
 description = "CHESS with DataMate adapter and offline vLLM/bge-m3 support"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "aiosqlite==0.20.0",
     "datasketch==1.6.4",
     "sqlvalidator==0.0.20",
     "func-timeout==4.3.5",
-    "grpcio-status==1.62.2",
+    "grpcio-status>=1.62.2",
     "httptools>=0.6.4",
     "ipykernel==6.29.4",
     "langchain-anthropic>=0.2.0",
@@ -24,24 +24,25 @@ dependencies = [
     "pip-chill==1.0.3",
     "pipreqs==0.5.0",
     "python-dotenv==1.0.1",
-    "sentence-transformers==2.7.0",
+    "sentence-transformers>=3.0.0",
     "sqlglot==23.3.0",
     "uvloop==0.19.0",
     "watchfiles==0.21.0",
-    "websockets==12.0",
-    "filelock==3.15.4",
+    "websockets>=13.0.0",
+    "filelock>=3.15.4",
     "faiss-cpu==1.16.0",
     "datasets==2.21.0",
     "pyyaml==6.0.2",
-    "numpy>=2.5,<3",
+    "numpy>=2.0,<3",
     "pyarrow>=26",
     "polars==2.1.0",
     "fastexcel==0.21.0",
-    "torch>=2.15",
+    "torch>=2.14",
     "transformers>=4.57",
     "FlagEmbedding==1.4.2",
     "chromadb==0.5.20",
     "openai>=1.109",
+    "vllm>=0.33.0",
 ]
 
 [tool.uv]
